@@ -1,5 +1,28 @@
-playwright==1.44.0
+# ============================================================
+# requirements.txt — compatível com Python 3.11/3.12
+# ============================================================
+
+# Web framework
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+
+# Agendador
 apscheduler==3.10.4
+
+# Banco de dados
 sqlalchemy==2.0.30
 psycopg2-binary==2.9.9
+
+# HTTP client (scraper)
+httpx==0.27.0
+
+# Variáveis de ambiente
 python-dotenv==1.0.1
+
+# Playwright — versão compatível com Python 3.11/3.12
+playwright==1.44.0
+greenlet==3.0.3
+
+# Utilitários
+pydantic==2.7.1
+pydantic-settings==2.2.1
