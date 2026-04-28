@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-BAC BO — Serviço de Coleta
-==========================
-Responsabilidade ÚNICA: coletar o resultado mais recente do Bac Bo
-via scraping e salvar no banco PostgreSQL compartilhado.
-
-Roda a cada 30 segundos via APScheduler.
-O Railway (análise + Telegram) consome os dados deste banco.
-"""
 
 import asyncio
 import concurrent.futures
@@ -29,19 +20,19 @@ from sqlalchemy.orm import sessionmaker, DeclarativeBase, Mapped, mapped_column
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 INTERVALO_SEGUNDOS = int(os.environ.get("COLLECT_INTERVAL_SECONDS", "30"))
+
 URL_TIPMINER = "https://www.tipminer.com/br/historico/blaze/bac-bo-ao-vivo"
 
 if not DATABASE_URL:
-    raise RuntimeError("❌ Variável DATABASE_URL não configurada!")
+    raise RuntimeError("❌ DATABASE_URL não configurada!")
 
 # ============================================================
-# BANCO DE DADOS
+# BANCO DE DADOS (COM SSL PARA RENDER/RAILWAY)
 # ============================================================
 
 engine = create_engine(
@@ -49,8 +40,10 @@ engine = create_engine(
     pool_pre_ping=True,
     pool_size=3,
     max_overflow=5,
+    connect_args={"sslmode": "require"},  # 🔥 ESSENCIAL
 )
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+SessionLocal = sessionmaker(bind=engine)
 
 
 class Base(DeclarativeBase):
@@ -60,28 +53,25 @@ class Base(DeclarativeBase):
 class Resultado(Base):
     __tablename__ = "resultados"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    resultado: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
-    fonte: Mapped[str] = mapped_column(String(100), nullable=False, default="scraping")
-    timestamp: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    resultado: Mapped[str] = mapped_column(String(50), index=True)
+    fonte: Mapped[str] = mapped_column(String(100), default="scraping")
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     criado_em: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
+        DateTime(timezone=True), server_default=func.now()
     )
 
 
 def init_db():
-    """Cria tabelas se não existirem (seguro para rodar junto com o Railway)."""
     Base.metadata.create_all(bind=engine)
-    logger.info("✅ Banco de dados pronto.")
+    logger.info("✅ Banco conectado e pronto")
 
 
 # ============================================================
 # SCRAPER
 # ============================================================
 
-async def _scrape() -> str | None:
+async def _scrape():
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -89,132 +79,94 @@ async def _scrape() -> str | None:
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--disable-setuid-sandbox",
             ],
         )
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-            locale="pt-BR",
-        )
+
+        context = await browser.new_context()
         page = await context.new_page()
 
         try:
-            logger.info("[SCRAPER] Acessando TipMiner...")
-            await page.goto(URL_TIPMINER, wait_until="domcontentloaded", timeout=30000)
+            logger.info("🌐 Acessando site...")
+            await page.goto(URL_TIPMINER, timeout=30000)
 
-            await page.wait_for_selector(
-                'div[title*="PLAYER"], div[title*="BANKER"], div[title*="TIE"]',
-                timeout=20000,
-            )
-            await asyncio.sleep(1)
+            await page.wait_for_selector("div[title]", timeout=20000)
 
-            cells = await page.query_selector_all("div[title]")
-            logger.info(f"[SCRAPER] {len(cells)} elementos encontrados")
+            elementos = await page.query_selector_all("div[title]")
 
             resultados = []
-            for cell in cells:
-                title = await cell.get_attribute("title") or ""
-                match = re.search(r"(PLAYER|BANKER|TIE)", title)
-                if match:
-                    lado = match.group(1)
-                    if lado == "PLAYER":
-                        resultados.append("azul")
-                    elif lado == "BANKER":
-                        resultados.append("vermelho")
-                    elif lado == "TIE":
-                        resultados.append("branco")
+            for el in elementos:
+                title = await el.get_attribute("title") or ""
+                if "PLAYER" in title:
+                    resultados.append("azul")
+                elif "BANKER" in title:
+                    resultados.append("vermelho")
+                elif "TIE" in title:
+                    resultados.append("branco")
 
             if not resultados:
-                logger.warning("[SCRAPER] ❌ Nenhum resultado encontrado")
+                logger.warning("❌ Nenhum resultado encontrado")
                 return None
 
-            mais_recente = resultados[-1]
-            logger.info(f"[SCRAPER] ✅ {len(resultados)} resultados — mais recente: {mais_recente}")
-            return mais_recente
+            return resultados[-1]
 
         except Exception as e:
-            logger.error(f"[SCRAPER] ❌ Erro: {e}")
+            logger.error(f"❌ Erro scraping: {e}")
             return None
 
         finally:
             await browser.close()
 
 
-def _run_em_thread() -> str | None:
-    """Roda o scraper async em thread isolada para evitar conflito de event loop."""
-    def _nova_loop():
+def run_scraper():
+    def run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(_scrape())
-        finally:
-            loop.close()
+        return loop.run_until_complete(_scrape())
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_nova_loop)
-        return future.result(timeout=60)
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        return executor.submit(run).result()
 
 
 # ============================================================
-# COLETA + SAVE
+# SALVAR DADOS
 # ============================================================
 
 def coletar_e_salvar():
-    """Coleta resultado e salva no banco se for novo."""
-    logger.info("🔄 Iniciando ciclo de coleta...")
+    logger.info("🔄 Coletando...")
 
-    try:
-        valor = _run_em_thread()
-    except Exception as e:
-        logger.error(f"❌ Scraper falhou: {e}")
-        return
+    resultado = run_scraper()
 
-    if valor is None:
-        logger.warning("⚠️  Scraper retornou None — pulando ciclo.")
+    if not resultado:
         return
 
     db = SessionLocal()
+
     try:
-        db.execute(text("SELECT 1"))  # testa conexão
+        db.execute(text("SELECT 1"))
 
-        ultimo = (
-            db.query(Resultado)
-            .order_by(Resultado.timestamp.desc())
-            .first()
-        )
+        ultimo = db.query(Resultado).order_by(Resultado.id.desc()).first()
 
-        if ultimo and ultimo.resultado == valor:
-            logger.info(f"🔁 Resultado repetido ({valor}) — ignorando.")
+        if ultimo and ultimo.resultado == resultado:
+            logger.info("🔁 Repetido, ignorando")
             return
 
         novo = Resultado(
-            resultado=valor,
-            fonte="scraping-render",
+            resultado=resultado,
+            fonte="render",
             timestamp=datetime.now(timezone.utc),
         )
+
         db.add(novo)
         db.commit()
-        logger.info(f"💾 Salvo: {valor}")
+
+        logger.info(f"💾 Salvo: {resultado}")
 
     except Exception as e:
         db.rollback()
-        logger.error(f"❌ Erro ao salvar no banco: {e}")
+        logger.error(f"❌ Erro banco: {e}")
+
     finally:
         db.close()
-
-
-# ============================================================
-# PING — evita hibernação no Render free
-# ============================================================
-
-def ping():
-    """Mantém o serviço acordado no Render (plano gratuito hiberna após 15min)."""
-    logger.debug("💓 Ping — serviço ativo")
 
 
 # ============================================================
@@ -222,33 +174,19 @@ def ping():
 # ============================================================
 
 if __name__ == "__main__":
-    logger.info("🚀 BAC BO Coletor iniciando...")
+    logger.info("🚀 Iniciando coletor...")
+
     init_db()
 
-    scheduler = BlockingScheduler(timezone="UTC")
+    scheduler = BlockingScheduler()
 
-    # Coleta a cada 30 segundos
     scheduler.add_job(
         coletar_e_salvar,
         "interval",
         seconds=INTERVALO_SEGUNDOS,
-        id="coleta",
         max_instances=1,
-        coalesce=True,
     )
 
-    # Ping a cada 10 minutos (evita hibernação no Render free)
-    scheduler.add_job(
-        ping,
-        "interval",
-        minutes=10,
-        id="ping",
-    )
+    logger.info("⏱️ Rodando...")
 
-    logger.info(f"⏱️  Coleta configurada a cada {INTERVALO_SEGUNDOS}s")
-    logger.info("✅ Scheduler iniciado — aguardando ciclos...")
-
-    try:
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("🛑 Coletor encerrado.")
+    scheduler.start()
