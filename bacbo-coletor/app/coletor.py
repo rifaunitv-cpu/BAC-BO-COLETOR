@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import asyncio
-import concurrent.futures
+# ============================================================
+# Coletor Bac Bo — API da Blaze (sem Playwright, sem login)
+# ============================================================
+
 import logging
 import os
-import re
 from datetime import datetime, timezone
 
+import httpx
 from apscheduler.schedulers.blocking import BlockingScheduler
-from playwright.async_api import async_playwright
 from sqlalchemy import create_engine, text, String, DateTime, Integer, func
 from sqlalchemy.orm import sessionmaker, DeclarativeBase, Mapped, mapped_column
 
@@ -26,13 +27,33 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.environ.get("DATABASE_URL")
 INTERVALO_SEGUNDOS = int(os.environ.get("COLLECT_INTERVAL_SECONDS", "30"))
 
-URL_TIPMINER = "https://www.tipminer.com/br/historico/blaze/bac-bo-ao-vivo"
+# API pública da Blaze — funciona de São Paulo sem bloqueio
+URL_API = "https://blaze.bet.br/api/singleplayer-originals/originals/bac_bo/recent/1/simple"
+TIMEOUT = 15
 
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL não configurada!")
 
 # ============================================================
-# BANCO DE DADOS (COM SSL PARA RENDER/RAILWAY)
+# MAPEAMENTO
+#   player / jogador = AZUL      🔵
+#   banker / banca   = VERMELHO  🔴
+#   tie    / empate  = BRANCO    ⚪
+# ============================================================
+MAPA_RESULTADO = {
+    "player":  "azul",
+    "banker":  "vermelho",
+    "tie":     "branco",
+    "jogador": "azul",
+    "banca":   "vermelho",
+    "empate":  "branco",
+    "1":       "azul",
+    "2":       "vermelho",
+    "0":       "branco",
+}
+
+# ============================================================
+# BANCO DE DADOS
 # ============================================================
 
 engine = create_engine(
@@ -40,7 +61,7 @@ engine = create_engine(
     pool_pre_ping=True,
     pool_size=3,
     max_overflow=5,
-    connect_args={"sslmode": "require"},  # 🔥 ESSENCIAL
+    connect_args={"sslmode": "require"},
 )
 
 SessionLocal = sessionmaker(bind=engine)
@@ -68,63 +89,61 @@ def init_db():
 
 
 # ============================================================
-# SCRAPER
+# SCRAPER — API da Blaze
 # ============================================================
 
-async def _scrape():
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
-        )
+def coletar_resultado() -> str | None:
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Referer": "https://blaze.bet.br/",
+        }
 
-        context = await browser.new_context()
-        page = await context.new_page()
+        with httpx.Client(timeout=TIMEOUT) as client:
+            response = client.get(URL_API, headers=headers)
 
-        try:
-            logger.info("🌐 Acessando site...")
-            await page.goto(URL_TIPMINER, timeout=30000)
-
-            await page.wait_for_selector("div[title]", timeout=20000)
-
-            elementos = await page.query_selector_all("div[title]")
-
-            resultados = []
-            for el in elementos:
-                title = await el.get_attribute("title") or ""
-                if "PLAYER" in title:
-                    resultados.append("azul")
-                elif "BANKER" in title:
-                    resultados.append("vermelho")
-                elif "TIE" in title:
-                    resultados.append("branco")
-
-            if not resultados:
-                logger.warning("❌ Nenhum resultado encontrado")
-                return None
-
-            return resultados[-1]
-
-        except Exception as e:
-            logger.error(f"❌ Erro scraping: {e}")
+        if response.status_code != 200:
+            logger.warning(f"API Blaze retornou status {response.status_code}")
             return None
 
-        finally:
-            await browser.close()
+        data = response.json()
 
+        # Pega a rodada mais recente
+        if isinstance(data, list) and len(data) > 0:
+            rodada = data[0]
+        elif isinstance(data, dict):
+            rodada = data
+        else:
+            logger.warning("Formato inesperado da API Blaze")
+            return None
 
-def run_scraper():
-    def run():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        return loop.run_until_complete(_scrape())
+        # Tenta os campos mais comuns
+        resultado_raw = (
+            rodada.get("winner") or
+            rodada.get("result") or
+            rodada.get("color") or
+            rodada.get("side") or
+            rodada.get("outcome") or
+            ""
+        )
 
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        return executor.submit(run).result()
+        resultado_raw = str(resultado_raw).lower().strip()
+        valor = MAPA_RESULTADO.get(resultado_raw)
+
+        if valor:
+            logger.info(f"✅ Coletado: {valor} (raw='{resultado_raw}')")
+            return valor
+
+        logger.warning(f"Campo desconhecido: '{resultado_raw}' — rodada: {rodada}")
+        return None
+
+    except httpx.TimeoutException:
+        logger.error(f"Timeout na API Blaze ({TIMEOUT}s)")
+        return None
+    except Exception as e:
+        logger.error(f"❌ Erro ao coletar: {e}")
+        return None
 
 
 # ============================================================
@@ -134,9 +153,10 @@ def run_scraper():
 def coletar_e_salvar():
     logger.info("🔄 Coletando...")
 
-    resultado = run_scraper()
+    resultado = coletar_resultado()
 
     if not resultado:
+        logger.warning("Sem resultado — pulando ciclo")
         return
 
     db = SessionLocal()
@@ -147,7 +167,7 @@ def coletar_e_salvar():
         ultimo = db.query(Resultado).order_by(Resultado.id.desc()).first()
 
         if ultimo and ultimo.resultado == resultado:
-            logger.info("🔁 Repetido, ignorando")
+            logger.info("🔁 Repetido — ignorando")
             return
 
         novo = Resultado(
